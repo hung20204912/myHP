@@ -1,0 +1,118 @@
+# MIT License
+#
+# Copyright (c) 2018 Evgeny Medvedev, evge.medvedev@gmail.com
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import logging
+import time
+
+from web3 import Web3, WebsocketProvider
+from requests.exceptions import HTTPError
+from ethereumetl.executors.batch_work_executor import BatchWorkExecutor
+from blockchainetl.jobs.base_job import BaseJob
+from ethereumetl.mappers.token_transfer_mapper import EthTokenTransferMapper
+from ethereumetl.mappers.receipt_log_mapper import EthReceiptLogMapper
+from ethereumetl.service.token_transfer_extractor import EthTokenTransferExtractor, TRANSFER_EVENT_TOPIC
+from ethereumetl.utils import validate_range
+from configs.config import Providers, SIZES
+
+logger = logging.getLogger('ExportTokenTransfersJob')
+
+
+class ExportTokenTransfersJob(BaseJob):
+    def __init__(
+            self,
+            start_block,
+            end_block,
+            batch_size,
+            web3,
+            item_exporter,
+            max_workers,
+            batch_web3_provider=None,
+            tokens=None):
+        validate_range(start_block, end_block)
+        self.start_block = start_block
+        self.end_block = end_block
+        if isinstance(batch_web3_provider, WebsocketProvider):
+            self.web3 = Web3(batch_web3_provider)
+        else:
+            self.web3 = web3
+        self.tokens = tokens
+        self.item_exporter = item_exporter
+
+        self.batch_work_executor = BatchWorkExecutor(batch_size, max_workers)
+
+        self.receipt_log_mapper = EthReceiptLogMapper()
+        self.token_transfer_mapper = EthTokenTransferMapper()
+        self.token_transfer_extractor = EthTokenTransferExtractor()
+        self.retries_count = 0
+
+    def _start(self):
+        self.item_exporter.open()
+        self.token_transfers = []
+
+    def _export(self):
+        self.batch_work_executor.execute(
+            range(self.start_block, self.end_block + 1),
+            self._export_batch,
+            total_items=self.end_block - self.start_block + 1
+        )
+
+    def _export_batch(self, block_number_batch):
+        assert len(block_number_batch) > 0
+        filter_params = {
+            'fromBlock': block_number_batch[0],
+            'toBlock': block_number_batch[-1],
+            'topics': [TRANSFER_EVENT_TOPIC]
+        }
+
+        if self.tokens is not None and len(self.tokens) > 0 and isinstance(self.tokens, list):
+            checksum_addresses = []
+            for address in self.tokens:
+                checksum_addresses.append(Web3.toChecksumAddress(address))
+            filter_params['address'] = checksum_addresses
+        event_filter = self.web3.eth.filter(filter_params)
+        events = event_filter.get_all_entries()
+        for event in events:
+            log = self.receipt_log_mapper.web3_dict_to_receipt_log(event)
+            token_transfer = self.token_transfer_extractor.extract_transfer_from_log(log)
+            if token_transfer is not None:
+                self.token_transfers.append(self.token_transfer_mapper.token_transfer_to_dict(token_transfer))
+        self.web3.eth.uninstallFilter(event_filter.filter_id)
+
+    def _end(self):
+        self.batch_work_executor.shutdown()
+        self.item_exporter.export_token_transfers(self.token_transfers)
+        self.item_exporter.close()
+
+
+if __name__ == '__main__':
+    from ethereumetl.streaming.streaming_exporter_creator import create_steaming_exporter
+
+    job = ExportTokenTransfersJob(
+        start_block=12793508,
+        end_block=12793608,
+        batch_size=90,
+        web3=Web3(
+            Web3.HTTPProvider('https://speedy-nodes-nyc.moralis.io/d50cdc2c637838fcf416892c/bsc/mainnet/archive')),
+        item_exporter=create_steaming_exporter(output='mongodb://127.0.0.1:27017', collector_id='jade_transfer'),
+        max_workers=8,
+        tokens=['0x7ad7242a99f21aa543f9650a56d141c57e4f6081']
+    )
+    job.run()
